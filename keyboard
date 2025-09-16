@@ -1,0 +1,247 @@
+import pyautogui
+import json
+import os
+import google.generativeai as genai
+import time
+import sys
+import ctypes
+import win32gui  # For window focus and context awareness
+
+# --- Configuration ---
+# To use this, set your API key as an environment variable named "GEMINI_API_KEY"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SCREENSHOT_DIR = "screenshots"  # Directory to store temporary screenshots
+
+# --- Initial Setup ---
+os.makedirs(SCREENSHOT_DIR, exist_ok=True) # Ensure screenshot directory exists
+
+# Check if the script is running with administrative privileges
+def is_admin():
+    """Checks for administrator privileges on Windows."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+if not is_admin():
+    print("⚠️ Warning: Script is not running as admin. Some actions (e.g., interacting with system windows or pressing the Windows key) may fail due to permissions. Run as admin for full access.")
+
+# Initialize Gemini client if the API key is available
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    # Using a fast and capable model suitable for this task
+    client = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    client = None
+    print("⚠️ Warning: GEMINI_API_KEY environment variable not set. The script will use mock (pre-written) responses instead of calling the AI.")
+
+# Configure PyAutoGUI safety features
+pyautogui.FAILSAFE = True  # Move mouse to top-left corner to abort
+pyautogui.PAUSE = 0.2     # A small pause between all actions for stability
+
+# --- Helper Functions ---
+def get_active_window_title():
+    """Get the title of the currently active window for better context and debugging."""
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        return win32gui.GetWindowText(hwnd)
+    except Exception:
+        return "Unknown"
+
+# --- Core LLM Interaction ---
+def get_llm_structured_response(user_prompt: str) -> str:
+    """
+    Sends the user's command to the Gemini API and asks for a structured JSON output.
+    Falls back to a mock response if the API key is not configured.
+    """
+    screen_size = pyautogui.size()
+    center_x = screen_size.width / 2
+    center_y = screen_size.height / 2
+
+    # The system prompt is the instruction manual for the AI.
+    # It defines its role, capabilities, and the required output format.
+    system_prompt = f"""
+    You are an AI agent with explicit permission to control the user's computer via PyAutoGUI functions.
+    Your task is to convert a user's natural language command into a precise JSON array of function calls.
+    The user's screen dimensions are {screen_size}. The origin (0, 0) is the top-left corner. The center is at ({center_x:.0f}, {center_y:.0f}).
+    Current active window is: "{get_active_window_title()}".
+
+    Available functions:
+    1.  `move_cursor(x: int, y: int)`: Moves the mouse to the (x, y) coordinates.
+    2.  `left_click()`: Performs a single left mouse click.
+    3.  `right_click()`: Performs a single right mouse click.
+    4.  `double_click()`: Performs a double left click.
+    5.  `drag_to(x: int, y: int, duration: float = 0.5)`: Drags the mouse to (x, y).
+    6.  `type_text(text: str)`: Types the given string.
+    7.  `press_key(key: str)`: Presses a single key (e.g., 'enter', 'tab', 'win', 'esc').
+    8.  `hotkey(keys: list[str])`: Presses a combination of keys (e.g., ['ctrl', 'c']).
+    9.  `wait(seconds: float)`: Pauses for a specified number of seconds.
+    10. `scroll(steps: int)`: Scrolls up (positive) or down (negative).
+    11. `take_screenshot(filename: str)`: Saves a screenshot to 'screenshots/{{filename}}.png'.
+    12. `locate_and_click(image_filename: str, confidence: float = 0.8)`: Locates an image on screen and clicks its center. Image must be in the 'screenshots' folder.
+
+    IMPORTANT:
+    - ALWAYS respond with ONLY a valid JSON array. Do not include any explanatory text, markdown, or comments.
+    - **Crucially, all parameters for every function MUST be nested inside a `"params": {{}}` object, even if it's empty.**
+    - Be logical. If the user wants to open an application, the steps are typically: press 'win', type the app name, wait for search results, press 'enter'.
+    - Use `wait` calls to allow time for applications to open or UI elements to load. A 1-2 second wait after opening an app is a good practice.
+    """
+
+    full_prompt = f"{system_prompt}\n\nUser request: \"{user_prompt}\""
+
+    if client:
+        try:
+            print(f"🤖 Sending prompt to Gemini... (Active window: {get_active_window_title()})")
+            response = client.generate_content(
+                full_prompt,
+                generation_config={"response_mime_type": "application/json"} # Force JSON output
+            )
+            llm_output = response.text.strip()
+            print(f"   ...Gemini response received.")
+            if llm_output.startswith('[') and llm_output.endswith(']'):
+                return llm_output
+            else:
+                print("❌ LLM output was not a valid JSON array. Falling back to mock.")
+        except Exception as e:
+            print(f"❌ Gemini API error: {e}. Falling back to mock.")
+    else:
+        print("🤖 Using mock LLM response...")
+
+    # Mock response for when the API key is not available
+    mock_llm_output = f"""
+    [
+        {{
+            "function": "move_cursor",
+            "params": {{"x": {center_x:.0f}, "y": {center_y:.0f}}}
+        }},
+        {{
+            "function": "left_click",
+            "params": {{}}
+        }},
+        {{
+            "function": "type_text",
+            "params": {{"text": "Hello from your AI assistant!"}}
+        }},
+        {{
+            "function": "wait",
+            "params": {{"seconds": 1}}
+        }},
+        {{
+            "function": "right_click",
+            "params": {{}}
+        }}
+    ]
+    """
+    return mock_llm_output
+
+# --- Action Execution Engine ---
+def execute_actions(actions_json: str):
+    """Parses the JSON and executes the corresponding pyautogui actions."""
+    try:
+        actions = json.loads(actions_json)
+        print("\n✅ Actions parsed. Preparing to execute...")
+        print(f"Full JSON plan:\n{json.dumps(actions, indent=2)}\n")
+
+        for i, action in enumerate(actions, 1):
+            func_name = action.get("function")
+            
+            # --- ROBUSTNESS FIX ---
+            # Gets the 'params' object if it exists, otherwise uses the main 'action'
+            # dictionary itself. This handles inconsistent LLM output gracefully.
+            params = action.get("params", action)
+
+            print(f"▶️ Executing Step {i}/{len(actions)}: {func_name}({params})")
+
+            try:
+                if func_name == "move_cursor":
+                    pyautogui.moveTo(int(params['x']), int(params['y']), duration=0.5)
+                elif func_name == "left_click":
+                    pyautogui.click()
+                elif func_name == "right_click":
+                    pyautogui.rightClick()
+                elif func_name == "double_click":
+                    pyautogui.doubleClick()
+                elif func_name == "drag_to":
+                    pyautogui.dragTo(int(params['x']), int(params['y']), duration=float(params.get('duration', 0.5)))
+                elif func_name == "type_text":
+                    pyautogui.typewrite(params['text'], interval=0.05)
+                elif func_name == "press_key":
+                    pyautogui.press(params['key'])
+                elif func_name == "hotkey":
+                    pyautogui.hotkey(*params['keys'])
+                elif func_name == "wait":
+                    time.sleep(float(params['seconds']))
+                elif func_name == "scroll":
+                    pyautogui.scroll(int(params['steps']))
+                elif func_name == "take_screenshot":
+                    filepath = os.path.join(SCREENSHOT_DIR, f"{params['filename']}.png")
+                    pyautogui.screenshot(filepath)
+                    print(f"   📸 Screenshot saved to {filepath}")
+                elif func_name == "locate_and_click":
+                    image_path = os.path.join(SCREENSHOT_DIR, params['image_filename'])
+                    if not os.path.exists(image_path):
+                         print(f"   ❌ Image file not found at {image_path}. Make sure a screenshot with this name exists.")
+                         continue # Skip to the next action
+                    
+                    location = pyautogui.locateCenterOnScreen(image_path, confidence=float(params.get('confidence', 0.8)))
+                    if location:
+                        pyautogui.click(location)
+                        print(f"   ✅ Located and clicked {params['image_filename']}")
+                    else:
+                        print(f"   ❌ Could not find image {params['image_filename']} on screen.")
+                else:
+                    print(f"   ⚠️ Warning: Unknown function '{func_name}'")
+
+            except pyautogui.FailSafeException:
+                print("\n🛑 FAILSAFE TRIGGERED! Execution aborted by user.")
+                sys.exit(1)
+            except Exception as action_e:
+                print(f"   ❌ Error during execution of '{func_name}': {action_e}")
+                break # Stop execution on first error
+
+    except json.JSONDecodeError:
+        print("❌ CRITICAL ERROR: Failed to decode the JSON response from the LLM. Cannot execute.")
+    except Exception as e:
+        print(f"❌ An unexpected error occurred: {e}")
+
+# --- Main Program Loop ---
+if __name__ == "__main__":
+    print("--- 🤖 LLM-Powered GUI Automation Agent ---")
+    print("WARNING: This script will take control of your mouse and keyboard.")
+    print("To abort at any time, move your mouse to the top-left corner of the screen.")
+    print("-" * 40)
+
+    # Allow passing command as a command-line argument
+    if len(sys.argv) > 1:
+        user_command = " ".join(sys.argv[1:])
+    else:
+        user_command = input("Enter your command (or press Enter for a demo): ").strip()
+        if not user_command:
+            user_command = "press the windows key, type notepad, wait 2 seconds, press enter, then type 'Hello, world! This is Gemini.' and press ctrl+s"
+            print(f"Running demo command: '{user_command}'")
+
+    # 1. Get the structured plan from the LLM
+    structured_command = get_llm_structured_response(user_prompt=user_command)
+
+    # 2. Ask for user confirmation before executing
+    if structured_command:
+        print("\nGenerated Action Plan:")
+        try:
+            # Pretty-print the JSON for readability
+            parsed_json = json.loads(structured_command)
+            print(json.dumps(parsed_json, indent=2))
+        except json.JSONDecodeError:
+            print("Invalid JSON received, cannot display plan.")
+            print(structured_command)
+
+        confirm = input("\nDo you want to execute this plan? (y/n): ").strip().lower()
+        if confirm == 'y':
+            print("\nExecuting in 3 seconds... (move mouse to top-left to abort)")
+            time.sleep(3)
+            execute_actions(structured_command)
+        else:
+            print("Execution cancelled by user.")
+    else:
+        print("Could not generate a valid command plan.")
+
+    print("\n🎉 Script finished.")
