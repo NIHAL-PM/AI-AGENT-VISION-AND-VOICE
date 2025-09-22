@@ -1,0 +1,273 @@
+"""
+Zephyr AI Therapist Client
+==========================
+
+Usage:
+  Normal run (camera input):
+    python zephyr_ai.py --mode camera
+
+  Screen share mode:
+    python zephyr_ai.py --mode screen
+
+  Audio-only:
+    python zephyr_ai.py --mode none
+
+  Full scripted demo mode (best for competition showcase):
+    python zephyr_ai.py --mode none --demo
+"""
+
+import os
+import asyncio
+import base64
+import io
+import traceback
+import argparse
+import cv2
+import pyaudio
+import PIL.Image
+import mss
+
+from google import genai
+from google.genai import types
+
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+SEND_SAMPLE_RATE = 16000
+RECEIVE_SAMPLE_RATE = 24000
+CHUNK_SIZE = 1024
+
+MODEL = "models/gemini-2.5-flash-preview-native-audio-dialog"
+DEFAULT_MODE = "camera"
+
+MASTER_PROMPT = """
+You are Zephyr, an AI therapist. 
+Your job is to provide compassionate, evidence-based support. 
+Always show empathy, validate feelings, encourage reflection, and gently guide the user towards helpful coping strategies. 
+Offer structured techniques (CBT reframing, grounding, breathing, journaling prompts, gratitude reflection). 
+Handle risk scenarios sensitively: if someone expresses suicidal or self-harm intent, acknowledge compassionately, encourage them to reach out to loved ones, and provide emergency numbers (India: 9152987821 AASRA helpline, US: 988 Suicide & Crisis Lifeline). 
+Keep a professional, warm, supportive tone. 
+Never provide medical diagnoses, but help the user explore thoughts, emotions, and behaviors safely. 
+Summarize sessions with key takeaways and 2–3 actionable steps.
+"""
+
+client = genai.Client(
+    http_options={"api_version": "v1beta"},
+    api_key=os.environ.get("GEMINI_API_KEY"),
+)
+
+CONFIG = types.LiveConnectConfig(
+    response_modalities=["AUDIO"],
+    media_resolution="MEDIA_RESOLUTION_MEDIUM",
+    speech_config=types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
+        )
+    ),
+    context_window_compression=types.ContextWindowCompressionConfig(
+        trigger_tokens=25600,
+        sliding_window=types.SlidingWindow(target_tokens=12800),
+    ),
+)
+
+pya = pyaudio.PyAudio()
+
+
+class AudioLoop:
+    def __init__(self, video_mode=DEFAULT_MODE, demo_mode=False):
+        self.video_mode = video_mode
+        self.demo_mode = demo_mode
+
+        self.audio_in_queue = None
+        self.out_queue = None
+        self.session = None
+        self.audio_stream = None
+
+    async def send_text(self):
+        """Interactive text input when not in demo mode"""
+        if self.demo_mode:
+            await self.run_demo_script()
+            return
+        while True:
+            text = await asyncio.to_thread(input, "message > ")
+            if text.lower() == "q":
+                break
+            await self.session.send(input=text or ".", end_of_turn=True)
+
+    async def run_demo_script(self):
+        """Full scripted 6–7 minute demo showcasing features"""
+        demo_lines = [
+            ("Patient", "Hello Zephyr, I’ve been feeling really anxious lately."),
+            ("Therapist", None),
+            ("Patient", "Sometimes my thoughts spiral, and I can’t focus."),
+            ("Therapist", None),
+            ("Patient", "On a scale of 1–10, I think my mood is around a 4."),
+            ("Therapist", None),
+            ("Patient", "Could you guide me through a short breathing exercise?"),
+            ("Therapist", None),
+            # Crisis injection
+            ("Patient", "Sometimes I feel like giving up."),
+            ("Therapist", None),
+            ("Patient", "Thanks for understanding. I feel a bit calmer now."),
+            ("Therapist", None),
+            ("Patient", "Can you give me a short summary of today’s session?"),
+            ("Therapist", None),
+        ]
+
+        for role, line in demo_lines:
+            await asyncio.sleep(3)  # pacing
+            if role == "Patient":
+                print(f"\n[Demo Patient]: {line}")
+                await self.session.send(input=line, end_of_turn=True)
+            else:
+                # Therapist response comes from model
+                await asyncio.sleep(1)
+
+        print("\n[Demo Completed] Session summary requested.")
+        await asyncio.sleep(5)
+        raise asyncio.CancelledError("Demo finished")
+
+    def _get_frame(self, cap):
+        ret, frame = cap.read()
+        if not ret:
+            return None
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = PIL.Image.fromarray(frame_rgb)
+        img.thumbnail([1024, 1024])
+        image_io = io.BytesIO()
+        img.save(image_io, format="jpeg")
+        image_io.seek(0)
+        image_bytes = image_io.read()
+        return {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}
+
+    async def get_frames(self):
+        cap = await asyncio.to_thread(cv2.VideoCapture, 0)
+        while True:
+            frame = await asyncio.to_thread(self._get_frame, cap)
+            if frame is None:
+                break
+            await asyncio.sleep(1.0)
+            await self.out_queue.put(frame)
+        cap.release()
+
+    def _get_screen(self):
+        sct = mss.mss()
+        monitor = sct.monitors[0]
+        i = sct.grab(monitor)
+        mime_type = "image/jpeg"
+        image_bytes = mss.tools.to_png(i.rgb, i.size)
+        img = PIL.Image.open(io.BytesIO(image_bytes))
+        image_io = io.BytesIO()
+        img.save(image_io, format="jpeg")
+        image_io.seek(0)
+        image_bytes = image_io.read()
+        return {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}
+
+    async def get_screen(self):
+        while True:
+            frame = await asyncio.to_thread(self._get_screen)
+            if frame is None:
+                break
+            await asyncio.sleep(1.0)
+            await self.out_queue.put(frame)
+
+    async def send_realtime(self):
+        while True:
+            msg = await self.out_queue.get()
+            await self.session.send(input=msg)
+
+    async def listen_audio(self):
+        if self.demo_mode:
+            return  # Skip mic capture in demo
+        mic_info = pya.get_default_input_device_info()
+        self.audio_stream = await asyncio.to_thread(
+            pya.open,
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SEND_SAMPLE_RATE,
+            input=True,
+            input_device_index=mic_info["index"],
+            frames_per_buffer=CHUNK_SIZE,
+        )
+        kwargs = {"exception_on_overflow": False} if __debug__ else {}
+        while True:
+            data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
+            await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
+
+    async def receive_audio(self):
+        while True:
+            turn = self.session.receive()
+            async for response in turn:
+                if data := response.data:
+                    self.audio_in_queue.put_nowait(data)
+                    continue
+                if text := response.text:
+                    print(f"[Zephyr]: {text}", end="")
+            while not self.audio_in_queue.empty():
+                self.audio_in_queue.get_nowait()
+
+    async def play_audio(self):
+        if self.demo_mode:
+            return
+        stream = await asyncio.to_thread(
+            pya.open,
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RECEIVE_SAMPLE_RATE,
+            output=True,
+        )
+        while True:
+            bytestream = await self.audio_in_queue.get()
+            await asyncio.to_thread(stream.write, bytestream)
+
+    async def run(self):
+        try:
+            async with (
+                client.aio.live.connect(model=MODEL, config=CONFIG) as session,
+                asyncio.TaskGroup() as tg,
+            ):
+                self.session = session
+                self.audio_in_queue = asyncio.Queue()
+                self.out_queue = asyncio.Queue(maxsize=5)
+
+                # Send master prompt once at session start
+                await self.session.send(input=MASTER_PROMPT, end_of_turn=True)
+
+                send_text_task = tg.create_task(self.send_text())
+                tg.create_task(self.send_realtime())
+                if not self.demo_mode:
+                    tg.create_task(self.listen_audio())
+                if self.video_mode == "camera":
+                    tg.create_task(self.get_frames())
+                elif self.video_mode == "screen":
+                    tg.create_task(self.get_screen())
+                tg.create_task(self.receive_audio())
+                if not self.demo_mode:
+                    tg.create_task(self.play_audio())
+
+                await send_text_task
+                raise asyncio.CancelledError("User requested exit")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            if self.audio_stream:
+                self.audio_stream.close()
+            traceback.print_exc()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default=DEFAULT_MODE,
+        help="Input stream mode",
+        choices=["camera", "screen", "none"],
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run full scripted demo mode (ignores mic input)",
+    )
+    args = parser.parse_args()
+    main = AudioLoop(video_mode=args.mode, demo_mode=args.demo)
+    asyncio.run(main.run())
